@@ -1,0 +1,602 @@
+---
+title: "COVID-19 HOSPITALIZATIONS TIME SERIES"
+Author: Helene Barrera
+output: html_document
+---
+
+```{r message = FALSE, warning =FALSE}
+library(dplyr)
+library(lubridate)
+library(ggplot2)
+library(tswge)
+library(reshape2) 
+library(mice)
+library(cowplot)
+library(vars)
+library(nnfor)
+library(caret)
+library(vctrs)
+library(rlang)
+library(modeltime.ensemble)
+
+```
+
+# DATA CLEANING
+### Healthcare.gov dataset
+```{r} 
+#Read in data and view data
+
+covid = read.csv("D:/MS in Data Science/1 Datasets/Sem 5/Covid_Cases_Timeseries.csv", header = T)
+
+dim(covid)
+```
+
+```{r}
+#Filter to only Texas
+txcovidvars <- covid[which(covid$state == 'TX'),]
+dim(txcovidvars)
+```
+
+```{r}
+#Narrow down variables to look at
+#Date, total #of inpatient beds, #of IP beds in use, % of IP beds in use 
+#of beds used by covid, %of beds used by covid patients, and covid deaths
+
+txcovid <- txcovidvars[c("date", "inpatient_beds", "inpatient_beds_used", "inpatient_beds_utilization", "inpatient_beds_used_covid", "percent_of_inpatients_with_covid", "deaths_covid")]
+```
+
+
+```{r}
+#Change date-time format and order by date
+txcovid$date<-as.Date(txcovid$date)
+txcovid <- txcovid[order(txcovid$date),]
+
+summary(txcovid)
+```
+There are 11 NA's for covid deaths, time based. For now, will impute using the defaults from the MICE package.
+```{r}
+which(is.na(txcovid$deaths_covid))
+```
+
+
+```{r include = FALSE}
+#Impute the 11 points with the mean
+txcovid$deaths_covid[is.na(txcovid$deaths_covid)] <- mean(txcovid$deaths_covid, na.rm= TRUE)
+
+```
+
+```{r}
+#double check NAs are gone
+which(is.na(txcovid$deaths_covid))
+```
+# DATA CLEANING
+### CDC Covid Vaccinations Dataset
+```{r}
+#Read in vaccination data from the CDC found here: https://github.com/owid/covid-19-data/tree/master/public/data/vaccinations#united-states-vaccination-data
+
+vaccine = read.csv("D:/MS in Data Science/1 Datasets/Sem 5/us_state_vaccinations_timeseries.csv", header = T)
+```
+
+```{r}
+#Filter to only Texas
+txvaxvars <- vaccine[which(vaccine$location == 'Texas'),]
+dim(txvaxvars)
+```
+
+```{r}
+#Narrow down variables
+txvax <- txvaxvars[c("date", "daily_vaccinations")]
+```
+
+```{r}
+#Change date-time format to match other data set
+txvax$date <-as.Date(txvax$date)
+```
+
+```{r}
+summary(txvax)
+```
+### Merge Datasets
+```{r}
+### MERGE DATASETS
+txdata <- left_join(txcovid, txvax, by = "date")
+```
+
+```{r}
+#Remove pre-vaccine data - will start Feb 2021 to make sure all variables are the same length of time.
+txdata <- subset(txdata, date >= "2021-02-01")
+```
+
+```{r}
+summary(txdata)
+```
+From the above summary, we can see the date range is correct - Feb 2021 through March 2022.There are no NAs or missing values entered as 0s. Interestingly, inpatient bed utilization ranges from 65% to 82%. There were reports of IP beds running out, and that may be true from a practical hospital by hospital basis, but at the state level this doesn't look to be the case. Covid hospitalizations take up about 12% of those beds on average, but got as high as 30% at one point. 
+
+
+# EXPLORITORY DATA ANALYSIS
+### Total Beds Used for Inpatient Hospitalizations
+```{r warning = FALSE}
+#Plot the realizations of the variables of interest
+#Originally planned to use Covid Deaths as well, but the data mirrored covid beds used so I chose not to. 
+txeda <- txdata[c("date", "inpatient_beds", "inpatient_beds_used", "inpatient_beds_used_covid", "daily_vaccinations")]
+txeda_long <- melt(txeda, id.vars = "date")
+```
+
+```{r include = FALSE}
+options(scipen=999) 
+ggplot(txeda_long, aes(x = date, y = value, col = variable)) + geom_line()
+```
+
+Total inpatient beds are more stationary than the beds used, which appear to peak in correlation with covid beds used.
+```{r}
+options(scipen=999) 
+ggplot(txeda_long, aes(x = date, y = value, col = variable)) + geom_line()
+```
+
+
+
+```{r}
+IP_Beds <- ggplot(txdata, aes(x=date, y=inpatient_beds)) + geom_line() + 
+  xlab("Time") + ylab("Total Inpatient Beds") + ggtitle("Total Inpatient Beds")
+```
+
+```{r}
+IP_Beds_Used <- ggplot(txdata, aes(x=date, y=inpatient_beds_used)) + geom_line() +
+  xlab("Time") + ylab("Inpatient Beds") + ggtitle("Total Inpatient Beds Used")
+```
+
+```{r}
+Covid_IP_Beds_Used <- ggplot(txdata, aes(x=date, y=inpatient_beds_used_covid)) + geom_line() + xlab("Time") + ylab("Covid Beds") + ggtitle("Inpatient Beds Used by Covid Patients")
+```
+
+```{r}
+Daily_Vaccinations <- ggplot(txdata, aes(x=date, y=daily_vaccinations)) + geom_line() + xlab("Time") + ylab("Daily Vaccinations") + ggtitle("Total Daily Vaccinations")
+```
+
+
+```{r}
+plot <- ggdraw() + draw_label("Title", fontface='bold')
+plot_grid(IP_Beds, IP_Beds_Used, Covid_IP_Beds_Used, Daily_Vaccinations, nrow = 4)
+```
+
+# MODEL 1
+### Univariate ARMA
+```{r results='hide'}
+plotts.wge(txdata$inpatient_beds_used)
+```
+
+
+```{r echo = FALSE, results='hide'}
+plotts.sample.wge(txdata$inpatient_beds_used)
+
+```
+
+Overfitting the data
+```{r}
+txdata_overfit = est.ar.wge(txdata$inpatient_beds_used, p=14)
+
+```
+```{r}
+factor.wge(c(rep(0,6),1))
+
+```
+
+
+Strong evidence of weekly seasonality 
+```{r results='hide'}
+#model out the seasonality s=7
+dif = artrans.wge(txdata$inpatient_beds_used, c(rep(0,6),1))
+plotts.sample.wge(dif)
+```
+Doesn't appear to be white noise
+```{r}
+pacf(dif)
+```
+
+
+Get models with the lowest AIC/BIC. An AR(8,1) appears on both lists.
+```{r}
+aic5.wge(dif, p=0:12, q= 0:3)
+aic5.wge(dif, p=0:12, q= 0:3, type = "bic")
+```
+
+
+```{r}
+final = est.arma.wge(dif, p=8, q=1)
+```
+
+```{r include = FALSE}
+final
+```
+
+### ARMA Model: Short 14-Day Forecast
+```{r results='hide'}
+model1_fore_short = fore.aruma.wge(txdata$inpatient_beds_used, phi = final$phi, theta = final$theta, s = 7,  limits = T, n.ahead = 14, lastn = T)
+model1_fore_short 
+```
+```{r}
+model1_ase_short = mean((txdata$inpatient_beds_used[(length(txdata$inpatient_beds_used)-13):length(txdata$inpatient_beds_used)]- model1_fore_short$f)^2)
+model1_ase_short
+```
+
+### ARMA Model: Long 90-Day Forecast
+```{r results='hide'}
+model1_fore_long = fore.aruma.wge(txdata$inpatient_beds_used, phi = final$phi, theta = final$theta, s = 7,  limits = T, n.ahead = 90, lastn = T)
+model1_fore_long
+```
+
+```{r}
+model1_ase_long = mean((txdata$inpatient_beds_used[(length(txdata$inpatient_beds_used)-89):length(txdata$inpatient_beds_used)]- model1_fore_long$f)^2)
+model1_ase_long
+```
+
+# MODEL 2
+### Univariate ARIMA Model
+This model removes an additional 1-B factor.
+
+```{r results='hide'}
+#model out the seasonality 1-B factor
+dif2 = artrans.wge(dif,1)
+
+plotts.sample.wge(dif2)
+```
+```{r}
+pacf(dif2)
+```
+
+Get models with the lowest AIC/BIC. An AR(7,1) appears on both lists.
+```{r}
+aic5.wge(dif2, p=0:12, q= 0:3)
+aic5.wge(dif2, p=0:12, q= 0:3, type = "bic")
+```
+
+
+```{r}
+final2 = est.arma.wge(dif2, p=7, q=1)
+
+```
+
+```{r include = FALSE}
+final2
+```
+
+### ARIMA Model: Short 14-Day Forecast
+```{r results='hide'}
+model2_fore_short = fore.aruma.wge(txdata$inpatient_beds_used, phi = final2$phi, theta = final2$theta, s = 7, d = 1,  limits = T, n.ahead = 14, lastn = T)
+model2_fore_short
+```
+
+
+```{r}
+model2_ase_short = mean((txdata$inpatient_beds_used[(length(txdata$inpatient_beds_used)-13):length(txdata$inpatient_beds_used)]- model2_fore_short$f)^2)
+model2_ase_short
+```
+### ARIMA Model: Long 90-Day Forecast
+
+```{r results='hide'}
+model2_fore_long = fore.aruma.wge(txdata$inpatient_beds_used, phi = final2$phi, theta = final2$theta, s = 7, d = 1,  limits = F, n.ahead = 90, lastn = T)
+model2_fore_long
+
+```
+
+
+
+```{r}
+model2_ase_long = mean((txdata$inpatient_beds_used[(length(txdata$inpatient_beds_used)-89):length(txdata$inpatient_beds_used)]- model2_fore_long$f)^2)
+model2_ase_long
+```
+
+
+
+
+# MODEL 3
+### Multivariate Regression 
+### With Vaccinations as a Leading Variable
+
+The VAR model will add covid inpatient beds used and daily vaccinations. Vaccinations will be lagged to account for the time it takes to take effect. Assuming 21 days between shots and 2 weeks for maximum effectiveness, that's ~35 days, so we will consider lags in that range. This may not be as helpful as it should be due to the first shot vs 2nd shot vs booster shot not being split out. Theoretically the 2nd shot would have the greatest negative correlation with inpatient beds after a 14-16 day lag. 
+
+```{r}
+#Check optimal lag value for daily vaccinations agains inpatient beds used. 
+ccf(txdata$daily_vaccinations, txdata$inpatient_beds_used, lag.max = 40)
+```
+
+```{r}
+#Remove columns that won't be used. 
+var_lag_data = subset(txdata, select = c(3, 5, 8))
+```
+
+```{r}
+#Lag vaccinations
+vax_lag = dplyr::lead(var_lag_data$daily_vaccinations, 16)
+var_lag_data$vax_lag = vax_lag
+```
+
+
+```{r}
+#Remove original daily vaccination variable
+var_lag_data = subset(var_lag_data, select = c(1, 2, 4))
+```
+```{r}
+#for if the full set is needed without doing the train/test split
+shortened_data = var_lag_data[1:405,]
+```
+
+### VAR Model: Short 14-Day Forecast
+
+```{r}
+#split the data. Because of lagged variable, we need to remove 16 days off the end of the set. Splitting 14 days before that for the forecast. 
+var_short_1 = var_lag_data[1:391,]
+var_short_2 = var_lag_data[392:405,]
+```
+
+
+```{r}
+#Pick AIC for covid beds -> (5,2)
+covid_p = aic.wge(var_short_1$inpatient_beds_used_covid, p=0:8, q=0:2)
+```
+
+```{r}
+#Pick AIC for vaccines -> (8,1)
+vax_p = aic.wge(var_short_1$vax_lag, p=0:8, q=0:2)
+```
+
+Covid bed Estimates:
+```{r}
+covid_est = est.arma.wge(var_short_1$inpatient_beds_used_covid, p=covid_p$p, q=covid_p$q)
+```
+IP Covid Beds 14 Day Forecast:
+
+```{r results='hide'}
+fore.arma.wge(var_short_1$inpatient_beds_used_covid, phi = covid_est$phi, theta=covid_est$theta, n.ahead = 14, lastn = F, limits = F)
+```
+Vax Estimates:
+```{r}
+vax_est = est.arma.wge(var_short_1$vax_lag, p=vax_p$p, q=vax_p$q)
+```
+Vax 14 Day Forecast:
+
+```{r results='hide'}
+fore.arma.wge(var_short_1$vax_lag, phi =vax_est$phi, theta=vax_est$theta, n.ahead = 14, lastn = F, limits = F)
+```
+
+
+
+```{r}
+#Fitting w leading vax variable
+#lowest AIC p = 9
+VARselect(var_short_1)
+```
+
+```{r}
+var_fit_short = VAR(var_short_1, p=9)
+```
+
+
+```{r}
+preds_short = predict(var_fit_short, n.ahead = 14)
+```
+
+
+```{r}
+plot(seq(1,405,1), shortened_data$inpatient_beds_used[1:405], type = "l", xlab = "Time", ylab = "Inpatient Beds Used", main = "VAR Model (14Day) Forecast")
+points(seq(392,405,1), preds_short$fcst$inpatient_beds_used[1:14,1], type ="l", lwd = 2, col = "red")
+```
+
+
+
+
+```{r}
+#Short 2 week forecast w leading var
+#541239506
+var_ase_short = mean((shortened_data$inpatient_beds_used[392:405] - preds_short$fcst$inpatient_beds_used)^2)
+var_ase_short
+```
+
+### VAR Model: Long 90-Day Forecast
+
+```{r}
+#split the data. Because of lagged variable, we need to remove 16 days off the end of the set. We are splitting 14 days before that for the forecast. 
+var_long_1 = var_lag_data[1:315,]
+var_long_2 = var_lag_data[316:405,]
+```
+
+
+```{r}
+#Pick AIC for covid beds -> (8,1)
+covid_p = aic.wge(var_long_1$inpatient_beds_used_covid, p=0:8, q=0:2)
+```
+
+```{r}
+#Pick AIC for vaccines -> (8,1)
+vax_p = aic.wge(var_long_1$vax_lag, p=0:8, q=0:2)
+```
+
+Covid bed Estimates:
+```{r}
+covid_est = est.arma.wge(var_long_1$inpatient_beds_used_covid, p=covid_p$p, q=covid_p$q)
+```
+IP Covid Beds 90 Day Forecast:
+
+```{r results='hide'}
+fore.arma.wge(var_long_1$inpatient_beds_used_covid, phi = covid_est$phi, theta=covid_est$theta, n.ahead = 90, lastn = F, limits = F)
+```
+Vax Estimates:
+```{r}
+vax_est = est.arma.wge(var_long_1$vax_lag, p=vax_p$p, q=vax_p$q)
+```
+Vax 90 Day Forecast:
+
+```{r results='hide'}
+fore.arma.wge(var_long_1$vax_lag, phi =vax_est$phi, theta=vax_est$theta, n.ahead = 90, lastn = F, limits = F)
+```
+
+```{r}
+#lowest AIC p = 9
+VARselect(var_long_1)
+```
+
+```{r}
+var_fit_long = VAR(var_long_1, p=9)
+```
+
+
+```{r}
+preds_long = predict(var_fit_long, n.ahead = 90)
+```
+
+```{r}
+plot(seq(1,405,1), shortened_data$inpatient_beds_used[1:405], type = "l", xlab = "Time", ylab = "Inpatient Beds Used", main = "VAR Model (90 Day) Forecast")
+points(seq(316,405,1), preds_long$fcst$inpatient_beds_used[1:90,1], type ="l", lwd = 2, col = "red")
+```
+
+
+
+```{r}
+#Long 90 Day Forecast w leading var
+var_ase_long = mean((var_lag_data$inpatient_beds_used[316:405] - preds_long$fcst$inpatient_beds_used)^2)
+var_ase_long
+```
+
+
+
+# MODEL 4
+### MLP Neural Network
+
+```{r}
+#Copy data set without lagged vaccine variable to not disrupt other models. 
+#The neural net will pick a lag as needed. 
+mlp_data = subset(txdata[1:405,],)
+```
+
+
+### MLP Model: Short 14-Day Forecast
+```{r}
+#create train and test splits
+mlp_short_train = subset(mlp_data[1:391,],)
+mlp_short_test = subset(mlp_data[392:405,],)
+```
+
+
+Build NN
+```{r}
+#Separete out the target variable into a train set univariate time series object
+#Create a data frame made up of the different explanatory univariate time series objects 
+
+inp_univar = ts(mlp_short_train$inpatient_beds_used)
+
+mlp_vars = data.frame(covid_univar = ts(mlp_data$inpatient_beds_used_covid), vax_univar = ts(mlp_data$daily_vaccinations))
+```
+
+
+
+```{r}
+#Use median for the fit since there are enormous outlier predictions that heavily skew the mean. 
+mlp_fit_short = mlp(inp_univar, xreg = mlp_vars, comb = "median")
+mlp_fit_short
+```
+
+```{r}
+mlp_fore_short = forecast(mlp_fit_short, h=14, xreg = mlp_vars)
+plot(mlp_fore_short)
+```
+
+```{r}
+plot(seq(1,405,1), shortened_data$inpatient_beds_used, type = "l", main = "MLP Model (14 day) Forecast vs Actual", xlab = "Time", ylab = "Inpatient Beds Used")
+points(seq(392,405,1), mlp_fore_short$mean, type ="l", lwd = 2, col = "red")
+```
+
+
+```{r}
+#4754072
+mlp_ase_short = mean((mlp_short_test$inpatient_beds_used - mlp_fore_short$mean)^2)
+mlp_ase_short
+```
+
+
+
+### MLP Model: Long 90-Day Forecast
+
+```{r}
+#create train and test splits for 90 day horizon
+mlp_long_train = subset(mlp_data[1:315,],)
+mlp_long_test = subset(mlp_data[316:405,],)
+```
+
+
+```{r}
+#Separate out the target variable into a train set univariate time series object
+#Create a data frame made up of the different explanatory univariate time series objects 
+
+inp_univar_long = ts(mlp_long_train$inpatient_beds_used)
+
+mlp_vars_long = data.frame(covid_univar = ts(mlp_data$inpatient_beds_used_covid), vax_univar = ts(mlp_data$daily_vaccinations))
+```
+
+
+
+```{r}
+mlp_fit_long = mlp(inp_univar_long, xreg = mlp_vars_long, comb = "median")
+mlp_fit_long
+```
+
+```{r}
+mlp_fore_long = forecast(mlp_fit_long, h=90, xreg = mlp_vars_long)
+plot(mlp_fore_long)
+```
+```{r}
+plot(seq(1,405,1), shortened_data$inpatient_beds_used, type = "l", main = "MLP Model (90 day) Forecast vs Actual", xlab = "Time", ylab = "Inpatient Beds Used")
+points(seq(316,405,1), mlp_fore_long$mean, type ="l", lwd = 2, col = "red")
+```
+
+```{r}
+#8994974
+mlp_ase = mean((mlp_long_test$inpatient_beds_used - mlp_fore_long$mean)^2)
+mlp_ase
+```
+
+
+
+
+# MODEL 5
+### Ensemble Method
+The VAR and MLP models (3 and 4 respectively) will be averaged together to build a well-rounded and more predictive model. 
+
+### Ensemble Model: Short 14-Day Forecast
+
+```{r}
+#Average the var model and MLP model predictions.
+ensemble_short = (preds_short$fcst$inpatient_beds_used[,1] + mlp_fore_short$mean)/2
+```
+
+```{r}
+plot(seq(1,405,1), shortened_data[,"inpatient_beds_used"], type = "l", xlab = "Time", ylab = "Inpatient Beds Used", main = "Ensemble VAR/MLP Model (14 Day) Forecast")
+lines(seq(392,405,1), ensemble_short, type = "l", lwd = 2, col = "red")
+```
+
+```{r}
+ensemble_ase_short = mean((shortened_data[392:405,"inpatient_beds_used"] - ensemble_short)^2)
+ensemble_ase_short
+```
+
+
+### Ensemble Model: Long 90-Day Forecast
+
+```{r}
+#Average the var model and MLP model predictions.
+ensemble_long = (preds_long$fcst$inpatient_beds_used[,1] + mlp_fore_long$mean)/2
+```
+
+```{r}
+plot(seq(1,405,1), shortened_data[,"inpatient_beds_used"], type = "l", xlab = "Time", ylab = "Inpatient Beds Used", main = "Ensemble VAR/MLP Model (90 Day) Forecast")
+lines(seq(316,405,1), ensemble_long, type = "l", lwd = 2, col = "red")
+```
+
+
+```{r}
+ensemble_ase_long = mean((shortened_data[316:405,"inpatient_beds_used"] - ensemble_long)^2)
+ensemble_ase_long
+```
+
+
+### Ensemble Model: Future Predictions
+
